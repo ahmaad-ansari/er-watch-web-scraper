@@ -200,6 +200,7 @@ class HTMLParser(BaseParser):
             text_regex = sel.get("textRegex")
             nth_of_type = sel.get("nthOfType")
             id_regex = sel.get("idRegex")
+            aria_regex = sel.get("ariaRegex")
 
             # Ensure 'current' is a valid Tag before searching within it.
             if not isinstance(current, Tag):
@@ -228,6 +229,16 @@ class HTMLParser(BaseParser):
                 candidates = [
                     c for c in candidates
                     if c.has_attr("id") and i_pattern.search(c["id"])
+                ]
+
+            # Filter by aria-label regex. Power BI labels every visual with its field name
+            # (e.g. "Patients Waiting To Be Seen", "CombinedTotalWait 2 hr ..."), which is far
+            # more stable than counting <tspan>s, whose number changes when values wrap.
+            if aria_regex:
+                a_pattern = re.compile(aria_regex, re.IGNORECASE)
+                candidates = [
+                    c for c in candidates
+                    if c.has_attr("aria-label") and a_pattern.search(c["aria-label"])
                 ]
 
             # Filter by text regex

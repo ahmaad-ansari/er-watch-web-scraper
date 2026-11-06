@@ -65,6 +65,42 @@ def print_run_summary(summary: RunSummary) -> None:
     print("=" * 60 + "\n")
 
 
+def write_github_summary(summary: RunSummary) -> None:
+    """
+    In GitHub Actions, surface problems where they're seen: a table on the run's summary page
+    and a warning annotation per failed hospital. Outside Actions this does nothing.
+    """
+    if not os.environ.get("GITHUB_ACTIONS"):
+        return
+
+    for failure in summary.failures:
+        first_line = (failure.error or "unknown error").splitlines()[0][:200]
+        print(f"::warning title=Scrape failed: {failure.hospital_id}::{first_line} ({failure.url})")
+
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    lines = [
+        "## Scraper run",
+        f"{summary.successful}/{summary.total} hospitals scraped ({summary.success_rate:.0f}%) "
+        f"in {summary.duration_seconds:.0f}s.",
+    ]
+    if summary.failures:
+        lines += ["", "### Failed (saved as offline)", "| Hospital | Action | Error |", "|---|---|---|"]
+        for f in summary.failures:
+            err = (f.error or "").splitlines()[0][:160].replace("|", "\\|") if f.error else ""
+            lines.append(f"| `{f.hospital_id}` | {f.action} | {err} |")
+    if summary.parsing_warnings:
+        lines += ["", "### Scraped, but configured fields came back empty", "| Hospital | Fields |", "|---|---|"]
+        by_hospital = {}
+        for w in summary.parsing_warnings:
+            by_hospital.setdefault(w.hospital_id, []).append(w.field)
+        for hospital_id, fields in sorted(by_hospital.items()):
+            lines.append(f"| `{hospital_id}` | {', '.join(fields)} |")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 async def main():
     """
     Main entry point for running the scraper. It:
@@ -100,6 +136,7 @@ async def main():
 
     # Step 4: Print the run summary with failure details.
     print_run_summary(summary)
+    write_github_summary(summary)
 
     logger.info("Scraper run complete.")
 

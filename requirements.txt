@@ -10,6 +10,7 @@ idna==3.10
 playwright==1.57.0
 psycopg2-binary==2.9.11
 pyee==13.0.0
+python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 pytz==2024.2
 requests==2.32.3

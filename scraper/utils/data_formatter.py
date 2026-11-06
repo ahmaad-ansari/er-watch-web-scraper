@@ -1,11 +1,81 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+from dateutil import parser as date_parser
 
 from scraper.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Every source is an Ontario hospital: wall-clock times without a zone are Toronto time.
+TORONTO = pytz.timezone("America/Toronto")
+TORONTO_UNITS = {"EST", "EDT", "ET", "EASTERN", "US/EASTERN", "AMERICA/TORONTO"}
+
+# A "last updated" time can't be in the future; allow some slack for clock skew.
+FUTURE_TOLERANCE = timedelta(hours=2)
+
+_HOURS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)(?![a-z])")
+_MINUTES_RE = re.compile(r"(\d+)\s*(?:minutes?|mins?|m)(?![a-z])")
+_CLOCK_RE = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2})(?![\d:])")
+
+
+def parse_duration_minutes(raw_value):
+    """
+    Tolerant fallback for wait-time text when a hospital's configured pattern doesn't match.
+
+    Handles "45 mins", "2 hrs", "1 hour and 48 minutes", "5h 33m", "05h28m", "5:22", "3.5 hours".
+    For ranges ("2 hr 48 min to 4 hr 23 min") the first value wins, matching the configured patterns.
+    Returns total minutes, or None if no duration is recognisable.
+    """
+    if not raw_value:
+        return None
+    text = raw_value.lower().replace(",", " ")
+
+    clock = _CLOCK_RE.search(text)
+    hours = _HOURS_RE.search(text)
+    minutes = _MINUTES_RE.search(text)
+
+    # "H:MM" only when there are no unit words (so "8:30 pm" style strings never get here as durations).
+    if clock and not hours and not minutes:
+        return int(clock.group(1)) * 60 + int(clock.group(2))
+
+    # Keep the first duration in the text: drop a minutes match that belongs to a later range value.
+    if hours and minutes and minutes.start() < hours.start():
+        hours = None
+    if not hours and not minutes:
+        return None
+    total = (float(hours.group(1)) * 60 if hours else 0) + (int(minutes.group(1)) if minutes else 0)
+    return round(total)
+
+
+def _localize(dt, unit, format_code):
+    """Attach a timezone: explicit UTC ("Z" or unit UTC) stays UTC, everything else is Toronto time."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(pytz.UTC)
+    if (format_code and "Z" in format_code) or (unit and unit.upper() == "UTC"):
+        return dt.replace(tzinfo=pytz.UTC)
+    if unit and unit.upper() not in TORONTO_UNITS:
+        logger.debug(f"Unknown timezone unit '{unit}' - assuming America/Toronto.")
+    return TORONTO.localize(dt, is_dst=False).astimezone(pytz.UTC)
+
+
+def _roll_back_if_future(dt_utc, date_was_inferred):
+    """
+    Sources that show only a time ("8:30 pm") or no year ("Nov 05, 20:30") get today's date / this
+    year filled in. Just after midnight (or New Year) that lands in the future: step back a day or a year.
+    """
+    if not date_was_inferred:
+        return dt_utc
+    now = datetime.now(pytz.UTC)
+    if dt_utc <= now + FUTURE_TOLERANCE:
+        return dt_utc
+    for step in (timedelta(days=1), None):
+        candidate = dt_utc - step if step else dt_utc.replace(year=dt_utc.year - 1)
+        if candidate <= now + FUTURE_TOLERANCE:
+            logger.info(f"lastUpdated {dt_utc} was in the future; rolled back to {candidate}")
+            return candidate
+    return dt_utc
 
 
 class DataFormatter:
@@ -53,78 +123,70 @@ class DataFormatter:
         # ---------------------------------------------------------------------
         if field == "lastUpdated":
             logger.debug(f"Processing 'lastUpdated' with raw_value='{raw_value}', pattern='{pattern}'")
-            match = re.search(pattern, raw_value)
 
-            if match:
-                date_time_str = match.group(1).strip()
-                logger.debug(f"Extracted datetime string: '{date_time_str}' from raw_value='{raw_value}'")
+            def normalize(s):
+                # Ordinals ("05th" -> "05"), "p.m."/"a.m." -> "PM"/"AM", microseconds capped at 6 digits.
+                s = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", s.strip())
+                s = re.sub(r"\b([ap])\.?m\.?(?![a-z])", lambda m: m.group(1).upper() + "M", s, flags=re.I)
+                s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+                return re.sub(r"\s+", " ", s)
 
+            # Toronto "today", used to fill in date parts a source doesn't show.
+            now_local = datetime.now(TORONTO).replace(tzinfo=None)
+            dt = None
+            date_was_inferred = False
+
+            # 1) The hospital's configured pattern + format.
+            match = re.search(pattern, raw_value) if pattern else None
+            if match and format_code:
+                candidate = normalize(match.group(1))
+                missing_day = "%d" not in format_code
+                missing_month = all(x not in format_code for x in ["%m", "%b", "%B"])
+                missing_year = all(x not in format_code for x in ["%Y", "%y"])
+                base_format = format_code
+                if missing_year:
+                    # Parse with the year attached; without it strptime assumes 1900 and rejects Feb 29.
+                    candidate = f"{candidate} {now_local.year}"
+                    base_format = f"{format_code} %Y"
+                # Also accept the same format with/without a space before AM/PM.
+                formats = [base_format, base_format.replace(" %p", "%p"), base_format.replace("%M%p", "%M %p")]
+                for fmt in dict.fromkeys(formats):
+                    try:
+                        dt = datetime.strptime(candidate, fmt)
+                        break
+                    except ValueError:
+                        continue
+                if dt is not None:
+                    # One replace() call, so no invalid intermediate date (e.g. Jan 31 -> "Feb 31").
+                    fill = {}
+                    if missing_day:
+                        fill["day"] = now_local.day
+                    if missing_month:
+                        fill["month"] = now_local.month
+                    try:
+                        dt = dt.replace(**fill)
+                    except ValueError:
+                        dt = None  # e.g. "31" with the current month being 30 days; fall back below
+                    date_was_inferred = missing_day or missing_month or missing_year
+
+            # 2) Fallback: lenient parse of the whole text, e.g. a site switching from
+            #    "November 5, 2026 at 8:30 pm" to "5 November 2026 at 8:30 pm".
+            if dt is None:
                 try:
-                    # Normalize ordinal suffixes (e.g., 1st, 2nd, etc.) and AM/PM
-                    normalized_str = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", date_time_str)
-
-                    # Convert "p.m." or "a.m." to uppercase AM/PM without dots
-                    normalized_str = re.sub(
-                        r"\b(p\.m\.?|a\.m\.?)",
-                        lambda m: m.group(0).replace(".", "").upper(),
-                        normalized_str
+                    default = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+                    dt = date_parser.parse(normalize(raw_value), fuzzy=True, default=default)
+                    date_was_inferred = True
+                    logger.warning(
+                        f"lastUpdated '{raw_value}' did not match pattern '{pattern}' / format "
+                        f"'{format_code}'; parsed leniently as {dt}. Update this target's instructions."
                     )
-
-                    # Truncate microseconds to 6 digits if present.
-                    normalized_str = re.sub(r"(\.\d{6})\d+", r"\1", normalized_str)
-
-                    logger.debug(f"Normalized datetime string: '{normalized_str}'")
-
-                    # 1) Parse the datetime naively using the provided format_code.
-                    dt = datetime.strptime(normalized_str, format_code)
-
-                    # 2) If day/month is missing in format_code, replace them with current date components.
-                    now = datetime.now()
-                    if "%d" not in format_code:
-                        dt = dt.replace(day=now.day)
-                    # If none of the format specifiers for month exist, fill in the current month.
-                    if all(x not in format_code for x in ["%m", "%b", "%B"]):
-                        dt = dt.replace(month=now.month)
-                    # If the year is missing, default to the current year.
-                    if "%Y" not in format_code:
-                        dt = dt.replace(year=now.year)
-
-                    # 3) Determine the timezone:
-                    #    - If format_code indicates "Z" -> attach UTC
-                    #    - Else, use 'unit' for the timezone (e.g., 'UTC', 'EST')
-                    if "Z" in format_code:
-                        # If there's a literal "Z" in the format, interpret as UTC.
-                        dt = dt.replace(tzinfo=pytz.UTC)
-                    else:
-                        # If 'unit' is passed as a timezone, attach it.
-                        if unit and unit.upper() == "UTC":
-                            dt = dt.replace(tzinfo=pytz.UTC)
-                        elif unit and unit.upper() == "EST":
-                            # Localize as Eastern Time
-                            eastern = pytz.timezone("US/Eastern")
-                            dt = eastern.localize(dt)
-                        else:
-                            # If no valid unit or unknown, we leave it naive (tzinfo=None).
-                            # Or you can decide on a default, e.g. UTC:
-                            logger.debug(f"Unknown or no timezone unit '{unit}' - leaving dt naive.")
-
-                    # 4) Convert to UTC if it has a tzinfo. If it's still naive, you can decide what to do:
-                    if dt.tzinfo is not None:
-                        dt = dt.astimezone(pytz.UTC)
-
-                    # 5) Ensure microseconds are capped at 6 digits (strptime already does this).
-                    dt = dt.replace(microsecond=dt.microsecond)
-
-                    logger.info(f"Successfully parsed 'lastUpdated' as UTC: '{dt}'")
-                    return dt
-
-                except ValueError as e:
-                    logger.error(f"Failed to parse datetime for field='{field}'. Error: {e}")
+                except (ValueError, OverflowError):
+                    logger.warning(f"Could not parse lastUpdated from '{raw_value}'. Returning None.")
                     return None
-            else:
-                logger.warning(f"No match found for field='{field}' using pattern='{pattern}'. "
-                               "Returning None.")
-                return None
+
+            dt = _roll_back_if_future(_localize(dt, unit, format_code), date_was_inferred)
+            logger.info(f"Successfully parsed 'lastUpdated' as UTC: '{dt}'")
+            return dt
 
         # ---------------------------------------------------------------------
         # 2) Handle "patientsWaiting" or "patientsInTreatment" (Integer Parsing)
@@ -135,8 +197,14 @@ class DataFormatter:
                 result = int(raw_value.strip())
                 logger.info(f"Successfully converted '{raw_value}' to integer: {result}")
                 return result
-            except ValueError as e:
-                logger.error(f"Failed to convert raw_value='{raw_value}' to int for field='{field}'. Error: {e}")
+            except ValueError:
+                # e.g. "1,234", "12 patients", "Waiting: 37"
+                match = re.search(r"\d[\d,]*", raw_value)
+                if match:
+                    result = int(match.group(0).replace(",", ""))
+                    logger.warning(f"Extracted {result} from non-numeric '{raw_value}' for field='{field}'.")
+                    return result
+                logger.error(f"Failed to convert raw_value='{raw_value}' to int for field='{field}'.")
                 return None
 
         # ---------------------------------------------------------------------
@@ -146,69 +214,17 @@ class DataFormatter:
             logger.debug(
                 f"Processing 'estimatedWaitTime' with raw_value='{raw_value}', pattern='{pattern}', unit='{unit}'"
             )
-
-            if unit == "minutes":
-                # Directly convert the raw_value to an integer (minutes).
-                try:
-                    result = round(int(float(raw_value)))
-                    logger.info(f"Converted '{raw_value}' to minutes: {result}")
-                    return result
-                except ValueError as e:
-                    logger.error(f"Failed to convert raw_value='{raw_value}' to minutes. Error: {e}")
-                    return None
-
-            elif unit == "hours":
-                # First attempt direct conversion (assuming raw_value is in hours).
-                try:
-                    result = round(int(float(raw_value) * 60))
-                    logger.info(f"Converted '{raw_value}' from hours to minutes: {result}")
-                    return result
-                except ValueError:
-                    logger.debug(
-                        f"Direct conversion of raw_value='{raw_value}' to minutes failed. "
-                        "Attempting regex pattern match."
+            result = DataFormatter._parse_wait_time(raw_value, pattern, unit)
+            if result is None:
+                # The configured pattern only covers the shapes seen when the target was set up
+                # (e.g. it requires hours, so "45 mins" fails). Try a tolerant parse before giving up.
+                result = parse_duration_minutes(raw_value)
+                if result is not None:
+                    logger.warning(
+                        f"estimatedWaitTime '{raw_value}' did not match pattern '{pattern}' (unit={unit}); "
+                        f"fallback parsed {result} minutes. Update this target's instructions."
                     )
-                # Use regex to extract hours if direct conversion fails.
-                match = re.match(pattern, raw_value)
-                if match:
-                    try:
-                        hours = float(match.group(1))
-                        minutes = hours * 60
-                        result = round(minutes)
-                        logger.info(f"Extracted '{raw_value}' using regex and converted to minutes: {result}")
-                        return result
-                    except ValueError as e:
-                        logger.error(f"Failed to extract hours from raw_value='{raw_value}'. Error: {e}")
-                        return None
-                else:
-                    logger.warning(f"Regex failed to match raw_value='{raw_value}' for field='{field}'.")
-                    return None
-
-            else:
-                # If 'unit' is not recognized or it's None, try parsing "X hours and Y minutes" style.
-                # Pattern may have optional hours group, so group(1) could be None
-                match = re.match(pattern, raw_value)
-                if match:
-                    try:
-                        hours_str = match.group(1)
-                        minutes_str = match.group(2)
-
-                        # Ensure at least one group matched (not both None)
-                        if not hours_str and not minutes_str:
-                            logger.warning(f"Pattern matched but no hours/minutes captured from '{raw_value}'. Returning None.")
-                            return None
-
-                        hours = int(hours_str) if hours_str else 0
-                        minutes = int(minutes_str) if minutes_str else 0
-                        total_minutes = hours * 60 + minutes
-                        logger.info(f"Extracted '{raw_value}' as {total_minutes} total minutes.")
-                        return total_minutes
-                    except (ValueError, IndexError) as e:
-                        logger.error(f"Failed to parse hours/minutes from raw_value='{raw_value}'. Error: {e}")
-                        return None
-                else:
-                    logger.warning(f"Invalid format for 'estimatedWaitTime': '{raw_value}'. Returning None.")
-                    return None
+            return result
 
         # ---------------------------------------------------------------------
         # 4) Handle Unrecognized Fields
@@ -218,6 +234,36 @@ class DataFormatter:
         )
         return raw_value
 
+    @staticmethod
+    def _parse_wait_time(raw_value, pattern, unit):
+        """The hospital's configured wait-time parsing. Returns minutes, or None if it doesn't fit."""
+        if unit in ("minutes", "hours"):
+            factor = 1 if unit == "minutes" else 60
+            try:
+                return round(float(raw_value) * factor)
+            except ValueError:
+                pass
+            # Not a bare number: for hours, the pattern's first group holds the (decimal) hours.
+            match = re.match(pattern, raw_value) if pattern else None
+            if match and match.group(1):
+                return round(float(match.group(1)) * factor)
+            logger.debug(f"'{raw_value}' is not a plain number of {unit} and pattern '{pattern}' did not match.")
+            return None
+
+        # Otherwise the pattern captures (hours, minutes); either group may be optional.
+        match = re.match(pattern, raw_value) if pattern else None
+        if not match:
+            logger.debug(f"Wait-time pattern '{pattern}' did not match '{raw_value}'.")
+            return None
+        groups = match.groups()
+        hours_str = groups[0] if len(groups) > 0 else None
+        minutes_str = groups[1] if len(groups) > 1 else None
+        if not hours_str and not minutes_str:
+            logger.debug(f"Pattern matched '{raw_value}' but captured no hours or minutes.")
+            return None
+        total = int(hours_str or 0) * 60 + int(minutes_str or 0)
+        logger.info(f"Extracted '{raw_value}' as {total} total minutes.")
+        return total
 
 if __name__ == "__main__":
     # Example usage and test cases to demonstrate the formatter's functionality.

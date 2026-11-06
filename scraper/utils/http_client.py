@@ -1,8 +1,11 @@
 """
 Shared aiohttp session manager with connection pooling for async HTTP requests.
 """
-import aiohttp
+import ssl
 from typing import Optional
+
+import aiohttp
+import certifi
 from scraper.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -21,6 +24,9 @@ async def get_session() -> aiohttp.ClientSession:
     global _session
     if _session is None or _session.closed:
         connector = aiohttp.TCPConnector(
+            # Use certifi's up-to-date CA bundle rather than the OS store: some hospital sites
+            # chain to newer roots (e.g. Halton Healthcare) that older system stores lack.
+            ssl=ssl.create_default_context(cafile=certifi.where()),
             limit=100,  # Max total connections
             limit_per_host=10,  # Max connections per host
             ttl_dns_cache=300,  # DNS cache TTL in seconds

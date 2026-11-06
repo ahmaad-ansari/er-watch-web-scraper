@@ -80,6 +80,11 @@ class PBIScraper(BaseScraper):
                 logger.error(error_msg)
                 raise Exception(error_msg)
 
+            # 3b) Network idle is not "rendered": Power BI draws its SVG text ~1-2s later, and a
+            #     half-drawn report shifts every positional selector. Wait until text exists and
+            #     the amount of it has stopped changing.
+            await self._wait_for_stable_render(page)
+
             # 4) Extract the fully rendered HTML content after JavaScript has executed.
             logger.debug("Extracting rendered HTML content from the page.")
             content = await page.content()
@@ -125,3 +130,36 @@ class PBIScraper(BaseScraper):
             raise Exception(error_msg)
 
         return self.process_parsed_data(parsed_data)
+
+    # How long the rendered text must stay unchanged before the report counts as drawn.
+    STABLE_FOR_MS = 1500
+    POLL_MS = 250
+    RENDER_TIMEOUT_MS = 20_000
+
+    async def _wait_for_stable_render(self, page):
+        """
+        Wait until the page has rendered text and that text has stopped changing.
+        Power BI reports are judged by their SVG text; other pages scraped through this
+        browser path (e.g. 'pbi_h' targets that aren't Power BI) by their body text.
+        """
+        signature_js = (
+            "() => { const svg = Array.from(document.querySelectorAll('svg text'))"
+            ".map(t => t.textContent).join('\\u0001');"
+            " return svg || (document.body ? document.body.innerText : ''); }"
+        )
+        last, stable_ms, waited = None, 0, 0
+        while waited < self.RENDER_TIMEOUT_MS:
+            signature = await page.evaluate(signature_js)
+            if signature and signature == last:
+                stable_ms += self.POLL_MS
+                if stable_ms >= self.STABLE_FOR_MS:
+                    logger.debug(f"Power BI render stable after {waited}ms")
+                    return
+            else:
+                stable_ms = 0
+            last = signature
+            await page.wait_for_timeout(self.POLL_MS)
+            waited += self.POLL_MS
+        if not last:
+            raise Exception(f"Power BI report rendered no text within {self.RENDER_TIMEOUT_MS // 1000}s")
+        logger.warning("Power BI text was still changing after the render timeout; parsing what is there")
