@@ -37,6 +37,10 @@ jobs:
       - name: Run the main script
         run: python -m scraper.main
 
+      # Refresh the site's cached home and hospital pages. The secret goes in a header (not the
+      # URL, which ends up in logs); --fail makes a rejected call fail the step instead of passing.
       - name: Revalidate Next.js Page
+        env:
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
         run: |
-          curl -L -X POST "https://er-watch.ca/api/revalidate?secret=${{ secrets.REVALIDATE_SECRET }}"
+          curl --fail --silent --show-error -X POST             -H "Authorization: Bearer $REVALIDATE_SECRET"             "https://er-watch.ca/api/revalidate"
